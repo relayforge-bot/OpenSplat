@@ -1,0 +1,247 @@
+name: OpenSplat Windows CUDA (RTX 4060 Ti / SM89)
+
+on:
+  push:
+    branches:
+      - build/windows-cuda-sm89
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opensplat-windows-cuda-sm89
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Windows 2022 - CUDA 12.4 - LibTorch cu124 - SM89
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout OpenSplat
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit 12.4
+        shell: pwsh
+        run: |
+          .github/workflows/cuda/Windows.ps1 12.4.0
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+          if (!(Test-Path "$cudaRoot\bin\nvcc.exe")) {
+            throw "CUDA 12.4 nvcc was not installed."
+          }
+
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V12_4=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_VX_Y=CUDA_PATH_V12_4" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NVTOOLSEXT_PATH=C:\Program Files\NVIDIA Corporation\NvToolsExt" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          & "$cudaRoot\bin\nvcc.exe" --version
+
+      - name: Install OpenCV 4.10.0
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/opencv/opencv/releases/download/4.10.0/opencv-4.10.0-windows.exe" -OutFile opencv.exe
+          Start-Process -Wait -FilePath .\opencv.exe -ArgumentList "-oopencv -y"
+          Remove-Item .\opencv.exe -Force
+
+          $opencvConfig = Join-Path $env:GITHUB_WORKSPACE "opencv\opencv\build\OpenCVConfig.cmake"
+          if (!(Test-Path $opencvConfig)) {
+            throw "OpenCVConfig.cmake not found at $opencvConfig"
+          }
+
+      - name: Install LibTorch CUDA 12.4
+        shell: pwsh
+        run: |
+          $url = "https://download.pytorch.org/libtorch/nightly/cu124/libtorch-win-shared-with-deps-latest.zip"
+          Invoke-WebRequest $url -OutFile libtorch.zip
+          Expand-Archive -Path .\libtorch.zip -DestinationPath $env:GITHUB_WORKSPACE
+          Remove-Item .\libtorch.zip -Force
+
+          $torchConfig = Join-Path $env:GITHUB_WORKSPACE "libtorch\share\cmake\Torch\TorchConfig.cmake"
+          if (!(Test-Path $torchConfig)) {
+            throw "TorchConfig.cmake not found at $torchConfig"
+          }
+
+      - name: Configure OpenSplat for CUDA SM89
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE\libtorch" -DOPENCV_DIR="$env:GITHUB_WORKSPACE\opencv\opencv\build" -DCMAKE_CUDA_ARCHITECTURES=89 -DOPENSPLAT_BUILD_SIMPLE_TRAINER=OFF -DOPENSPLAT_USE_PCH=ON
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build opensplat.exe
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target opensplat --parallel 4
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenSplat build failed with exit code $LASTEXITCODE"
+          }
+
+          $exe = Join-Path $env:GITHUB_WORKSPACE "build\Release\opensplat.exe"
+          if (!(Test-Path $exe)) {
+            throw "Build completed but opensplat.exe was not found at $exe"
+          }
+
+      - name: Stage executable and runtime dependencies
+        shell: pwsh
+        run: |
+          $workspace = $env:GITHUB_WORKSPACE
+          $stage = Join-Path $workspace "dist\OpenSplat-Windows-CUDA-SM89"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          $releaseDir = Join-Path $workspace "build\Release"
+          Get-ChildItem $releaseDir -File | Where-Object { $_.Name -eq "opensplat.exe" -or $_.Extension -eq ".dll" } | Copy-Item -Destination $stage -Force
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe not found; cannot locate the Visual C++ runtime."
+          }
+
+          $vsPath = & $vswhere -latest -products '*' -property installationPath
+          if (!$vsPath) {
+            throw "Visual Studio installation was not found."
+          }
+
+          $dumpbin = Get-ChildItem (Join-Path $vsPath "VC\Tools\MSVC") -Filter dumpbin.exe -Recurse | Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } | Select-Object -First 1
+          if (!$dumpbin) {
+            throw "dumpbin.exe was not found."
+          }
+
+          $searchRoots = @(
+            $stage,
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $workspace "libtorch\lib"),
+            (Join-Path $workspace "opencv\opencv\build\x64\vc16\bin"),
+            (Join-Path $env:NVTOOLSEXT_PATH "bin")
+          )
+
+          $vcRedistRoot = Join-Path $vsPath "VC\Redist\MSVC"
+          if (Test-Path $vcRedistRoot) {
+            Get-ChildItem $vcRedistRoot -Directory | ForEach-Object {
+              $crt = Join-Path $_.FullName "x64\Microsoft.VC143.CRT"
+              if (Test-Path $crt) {
+                $searchRoots += $crt
+              }
+            }
+          }
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          $processed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $queue.Enqueue((Join-Path $stage "opensplat.exe"))
+
+          while ($queue.Count -gt 0) {
+            $current = $queue.Dequeue()
+            if (!$processed.Add($current)) {
+              continue
+            }
+
+            $dependencyLines = & $dumpbin.FullName /DEPENDENTS $current 2>$null
+            foreach ($line in $dependencyLines) {
+              $dllName = "$line".Trim()
+              if ($dllName -notmatch '^[A-Za-z0-9_.+-]+\.dll$') {
+                continue
+              }
+
+              if ($dllName -match '^(api-ms-win-|ext-ms-win-)') {
+                continue
+              }
+
+              $destination = Join-Path $stage $dllName
+              if (!(Test-Path $destination)) {
+                $source = $null
+
+                foreach ($root in $searchRoots) {
+                  if (!$root -or !(Test-Path $root)) {
+                    continue
+                  }
+
+                  $candidate = Join-Path $root $dllName
+                  if (Test-Path $candidate) {
+                    $source = $candidate
+                    break
+                  }
+                }
+
+                if ($source) {
+                  Copy-Item $source $destination -Force
+                  Write-Host "Bundled runtime dependency: $dllName"
+                }
+                elseif (
+                  $dllName -in @("nvcuda.dll", "nvapi64.dll", "nvml.dll") -or
+                  (Test-Path (Join-Path "$env:WINDIR\System32" $dllName)) -or
+                  (Test-Path (Join-Path "$env:WINDIR\SysWOW64" $dllName))
+                ) {
+                  continue
+                }
+                else {
+                  throw "Missing runtime dependency '$dllName' referenced by '$current'."
+                }
+              }
+
+              if (Test-Path $destination) {
+                $queue.Enqueue($destination)
+              }
+            }
+          }
+
+          $readme = @"
+          OpenSplat Windows CUDA build
+          =============================
+
+          Target GPU architecture: NVIDIA SM 89 (RTX 4060 Ti)
+          Build runner: Windows Server 2022
+          CUDA Toolkit: 12.4
+          LibTorch: CUDA 12.4 nightly shared-with-deps
+          OpenCV: 4.10.0
+          Build configuration: Release
+
+          Run opensplat.exe --help to see command-line options.
+
+          This package includes application and redistributable runtime DLLs.
+          It does not include the NVIDIA display driver. Install a current
+          NVIDIA Windows driver on the target PC.
+
+          The build runner does not have an NVIDIA GPU, so CUDA training
+          performance and actual GPU execution must be verified on the target PC.
+          "@
+
+          Set-Content -Path (Join-Path $stage "README.txt") -Value $readme -Encoding UTF8
+
+          if (!(Test-Path (Join-Path $stage "opensplat.exe"))) {
+            throw "Staging folder does not contain opensplat.exe."
+          }
+
+          Write-Host "Staged files:"
+          Get-ChildItem $stage -File | Sort-Object Name | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Package Windows CUDA build
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:GITHUB_WORKSPACE "dist\OpenSplat-Windows-CUDA-SM89"
+          $zip = Join-Path $env:GITHUB_WORKSPACE "OpenSplat-Windows-CUDA-SM89.zip"
+
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal -Force
+
+          if (!(Test-Path $zip)) {
+            throw "ZIP package was not created."
+          }
+
+          Write-Host "Package size:"
+          Get-Item $zip | Select-Object Name, Length | Format-List
+
+      - name: Upload Windows CUDA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenSplat-Windows-CUDA-SM89
+          path: OpenSplat-Windows-CUDA-SM89.zip
+          if-no-files-found: error
+          retention-days: 14
